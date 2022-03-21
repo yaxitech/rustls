@@ -1,4 +1,5 @@
 use crate::check::{inappropriate_handshake_message, inappropriate_message};
+use crate::cipher::MessageDecrypter;
 use crate::conn::{CommonState, ConnectionRandoms, Side, State};
 use crate::enums::ProtocolVersion;
 use crate::error::{Error, PeerMisbehaved};
@@ -40,6 +41,7 @@ pub(super) use server_hello::CompleteServerHelloHandling;
 mod server_hello {
     use crate::msgs::enums::ExtensionType;
     use crate::msgs::handshake::HasServerExtensions;
+    use crate::msgs::handshake::ServerExtension;
     use crate::msgs::handshake::ServerHelloPayload;
 
     use super::*;
@@ -51,6 +53,7 @@ mod server_hello {
         pub(in crate::client) randoms: ConnectionRandoms,
         pub(in crate::client) using_ems: bool,
         pub(in crate::client) transcript: HandshakeHash,
+        pub(in crate::client) message_decrypter: Option<Box<dyn MessageDecrypter>>,
     }
 
     impl CompleteServerHelloHandling {
@@ -96,6 +99,37 @@ mod server_hello {
                 .is_some();
             if may_send_cert_status {
                 debug!("Server may staple OCSP response");
+            }
+
+            let renegotiation_info = server_hello
+                .find_extension(ExtensionType::RenegotiationInfo)
+                .map(|ext| match ext {
+                    ServerExtension::RenegotiationInfo(renegotiation_info) => renegotiation_info,
+                    _ => unreachable!(),
+                });
+
+            if cx.common.secure_renegotiation.is_none() {
+                if renegotiation_info.map_or(false, |it| !it.0.is_empty()) {
+                    cx.common
+                        .send_fatal_alert(AlertDescription::HandshakeFailure);
+                    return Err(Error::PeerMisbehaved(
+                        PeerMisbehaved::NonEmptyRenegotiationInfo,
+                    ));
+                }
+
+                cx.common.secure_renegotiation = Some(renegotiation_info.is_some());
+            } else if renegotiation_info.map_or(true, |it| {
+                it.0 != [
+                    &cx.common.client_verify_data[..],
+                    &cx.common.server_verify_data[..],
+                ]
+                .concat()
+            }) {
+                cx.common
+                    .send_fatal_alert(AlertDescription::HandshakeFailure);
+                return Err(Error::PeerMisbehaved(
+                    PeerMisbehaved::NonEmptyRenegotiationInfo,
+                ));
             }
 
             // Save any sent SCTs for verification against the certificate.
@@ -153,6 +187,7 @@ mod server_hello {
                             resuming: true,
                             cert_verified,
                             sig_verified,
+                            message_decrypter: self.message_decrypter,
                         }))
                     } else {
                         Ok(Box::new(ExpectCcs {
@@ -167,6 +202,7 @@ mod server_hello {
                             resuming: true,
                             cert_verified,
                             sig_verified,
+                            message_decrypter: self.message_decrypter,
                         }))
                     };
                 }
@@ -438,6 +474,7 @@ fn emit_certificate(
     transcript: &mut HandshakeHash,
     cert_chain: CertificatePayload,
     common: &mut CommonState,
+    must_encrypt: bool,
 ) {
     let cert = Message {
         version: ProtocolVersion::TLSv1_2,
@@ -448,10 +485,15 @@ fn emit_certificate(
     };
 
     transcript.add_message(&cert);
-    common.send_msg(cert, false);
+    common.send_msg(cert, must_encrypt);
 }
 
-fn emit_clientkx(transcript: &mut HandshakeHash, common: &mut CommonState, pubkey: &PublicKey) {
+fn emit_clientkx(
+    transcript: &mut HandshakeHash,
+    common: &mut CommonState,
+    pubkey: &PublicKey,
+    must_encrypt: bool,
+) {
     let mut buf = Vec::new();
     let ecpoint = PayloadU8::new(Vec::from(pubkey.as_ref()));
     ecpoint.encode(&mut buf);
@@ -466,13 +508,14 @@ fn emit_clientkx(transcript: &mut HandshakeHash, common: &mut CommonState, pubke
     };
 
     transcript.add_message(&ckx);
-    common.send_msg(ckx, false);
+    common.send_msg(ckx, must_encrypt);
 }
 
 fn emit_certverify(
     transcript: &mut HandshakeHash,
     signer: &dyn Signer,
     common: &mut CommonState,
+    must_encrypt: bool,
 ) -> Result<(), Error> {
     let message = transcript
         .take_handshake_buf()
@@ -491,17 +534,17 @@ fn emit_certverify(
     };
 
     transcript.add_message(&m);
-    common.send_msg(m, false);
+    common.send_msg(m, must_encrypt);
     Ok(())
 }
 
-fn emit_ccs(common: &mut CommonState) {
+fn emit_ccs(common: &mut CommonState, must_encrypt: bool) {
     let ccs = Message {
         version: ProtocolVersion::TLSv1_2,
         payload: MessagePayload::ChangeCipherSpec(ChangeCipherSpecPayload {}),
     };
 
-    common.send_msg(ccs, false);
+    common.send_msg(ccs, must_encrypt);
 }
 
 fn emit_finished(
@@ -510,8 +553,8 @@ fn emit_finished(
     common: &mut CommonState,
 ) {
     let vh = transcript.get_current_hash();
-    let verify_data = secrets.client_verify_data(&vh);
-    let verify_data_payload = Payload::new(verify_data);
+    common.client_verify_data = secrets.client_verify_data(&vh);
+    let verify_data_payload = Payload::new(common.client_verify_data.clone());
 
     let f = Message {
         version: ProtocolVersion::TLSv1_2,
@@ -770,13 +813,15 @@ impl State<ClientConnectionData> for ExpectServerDone {
         };
         cx.common.peer_certificates = Some(st.server_cert.cert_chain);
 
+        let must_encrypt = !cx.common.client_verify_data.is_empty();
+
         // 4.
         if let Some(client_auth) = &st.client_auth {
             let certs = match client_auth {
                 ClientAuthDetails::Empty { .. } => Vec::new(),
                 ClientAuthDetails::Verify { certkey, .. } => certkey.cert.clone(),
             };
-            emit_certificate(&mut st.transcript, certs, cx.common);
+            emit_certificate(&mut st.transcript, certs, cx.common, must_encrypt);
         }
 
         // 5a.
@@ -791,7 +836,7 @@ impl State<ClientConnectionData> for ExpectServerDone {
 
         // 5b.
         let mut transcript = st.transcript;
-        emit_clientkx(&mut transcript, cx.common, &kx.pubkey);
+        emit_clientkx(&mut transcript, cx.common, &kx.pubkey, must_encrypt);
         // nb. EMS handshake hash only runs up to ClientKeyExchange.
         let ems_seed = st
             .using_ems
@@ -799,11 +844,11 @@ impl State<ClientConnectionData> for ExpectServerDone {
 
         // 5c.
         if let Some(ClientAuthDetails::Verify { signer, .. }) = &st.client_auth {
-            emit_certverify(&mut transcript, signer.as_ref(), cx.common)?;
+            emit_certverify(&mut transcript, signer.as_ref(), cx.common, must_encrypt)?;
         }
 
         // 5d.
-        emit_ccs(cx.common);
+        emit_ccs(cx.common, must_encrypt);
 
         // 5e. Now commit secrets.
         let secrets = ConnectionSecrets::from_key_exchange(
@@ -819,11 +864,24 @@ impl State<ClientConnectionData> for ExpectServerDone {
             &secrets.randoms.client,
             &secrets.master_secret,
         );
+
+        let (dec, enc) = secrets.make_cipher_pair(Side::Client);
+
         cx.common
-            .start_encryption_tls12(&secrets, Side::Client);
+            .record_layer
+            .prepare_message_encrypter(enc);
         cx.common
             .record_layer
             .start_encrypting();
+
+        let message_decrypter = if cx.common.record_layer.is_decrypting() {
+            Some(dec)
+        } else {
+            cx.common
+                .record_layer
+                .prepare_message_decrypter(dec);
+            None
+        };
 
         // 6.
         emit_finished(&secrets, &mut transcript, cx.common);
@@ -840,6 +898,7 @@ impl State<ClientConnectionData> for ExpectServerDone {
                 resuming: false,
                 cert_verified,
                 sig_verified,
+                message_decrypter,
             }))
         } else {
             Ok(Box::new(ExpectCcs {
@@ -854,6 +913,7 @@ impl State<ClientConnectionData> for ExpectServerDone {
                 resuming: false,
                 cert_verified,
                 sig_verified,
+                message_decrypter,
             }))
         }
     }
@@ -870,6 +930,7 @@ struct ExpectNewTicket {
     resuming: bool,
     cert_verified: verify::ServerCertVerified,
     sig_verified: verify::HandshakeSignatureValid,
+    message_decrypter: Option<Box<dyn MessageDecrypter>>,
 }
 
 impl State<ClientConnectionData> for ExpectNewTicket {
@@ -898,6 +959,7 @@ impl State<ClientConnectionData> for ExpectNewTicket {
             resuming: self.resuming,
             cert_verified: self.cert_verified,
             sig_verified: self.sig_verified,
+            message_decrypter: self.message_decrypter,
         }))
     }
 }
@@ -915,6 +977,7 @@ struct ExpectCcs {
     resuming: bool,
     cert_verified: verify::ServerCertVerified,
     sig_verified: verify::HandshakeSignatureValid,
+    message_decrypter: Option<Box<dyn MessageDecrypter>>,
 }
 
 impl State<ClientConnectionData> for ExpectCcs {
@@ -931,6 +994,12 @@ impl State<ClientConnectionData> for ExpectCcs {
         // CCS should not be received interleaved with fragmented handshake-level
         // message.
         cx.common.check_aligned_handshake()?;
+
+        if let Some(dec) = self.message_decrypter {
+            cx.common
+                .record_layer
+                .prepare_message_decrypter(dec);
+        }
 
         // nb. msgs layer validates trivial contents of CCS
         cx.common
@@ -1027,12 +1096,12 @@ impl State<ClientConnectionData> for ExpectFinished {
 
         // Work out what verify_data we expect.
         let vh = st.transcript.get_current_hash();
-        let expect_verify_data = st.secrets.server_verify_data(&vh);
+        cx.common.server_verify_data = st.secrets.server_verify_data(&vh);
 
         // Constant-time verification of this is relatively unimportant: they only
         // get one chance.  But it can't hurt.
         let _fin_verified =
-            constant_time::verify_slices_are_equal(&expect_verify_data, &finished.0)
+            constant_time::verify_slices_are_equal(&cx.common.server_verify_data, &finished.0)
                 .map_err(|_| {
                     cx.common
                         .send_fatal_alert(AlertDescription::DecryptError);
@@ -1046,7 +1115,7 @@ impl State<ClientConnectionData> for ExpectFinished {
         st.save_session(cx);
 
         if st.resuming {
-            emit_ccs(cx.common);
+            emit_ccs(cx.common, false);
             cx.common
                 .record_layer
                 .start_encrypting();
@@ -1059,6 +1128,8 @@ impl State<ClientConnectionData> for ExpectFinished {
             _cert_verified: st.cert_verified,
             _sig_verified: st.sig_verified,
             _fin_verified,
+            server_name: st.server_name,
+            config: st.config,
         }))
     }
 }
@@ -1069,22 +1140,31 @@ struct ExpectTraffic {
     _cert_verified: verify::ServerCertVerified,
     _sig_verified: verify::HandshakeSignatureValid,
     _fin_verified: verify::FinishedMessageVerified,
+    server_name: ServerName,
+    config: Arc<ClientConfig>,
 }
 
 impl State<ClientConnectionData> for ExpectTraffic {
     fn handle(self: Box<Self>, cx: &mut ClientContext<'_>, m: Message) -> hs::NextStateOrError {
         match m.payload {
-            MessagePayload::ApplicationData(payload) => cx
-                .common
-                .take_received_plaintext(payload),
-            payload => {
-                return Err(inappropriate_message(
-                    &payload,
-                    &[ContentType::ApplicationData],
-                ));
+            MessagePayload::ApplicationData(payload) => {
+                cx.common
+                    .take_received_plaintext(payload);
+                Ok(self)
             }
+            MessagePayload::Handshake {
+                parsed:
+                    HandshakeMessagePayload {
+                        payload: HandshakePayload::HelloRequest,
+                        ..
+                    },
+                ..
+            } => hs::start_handshake(self.server_name, vec![], self.config, cx),
+            payload => Err(inappropriate_message(
+                &payload,
+                &[ContentType::ApplicationData],
+            )),
         }
-        Ok(self)
     }
 
     fn export_keying_material(

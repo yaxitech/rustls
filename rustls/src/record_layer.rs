@@ -53,6 +53,10 @@ impl RecordLayer {
         self.encrypt_state == DirectionState::Active
     }
 
+    pub(crate) fn is_decrypting(&self) -> bool {
+        self.decrypt_state == DirectionState::Active
+    }
+
     #[cfg(feature = "secret_extraction")]
     pub(crate) fn write_seq(&self) -> u64 {
         self.write_seq
