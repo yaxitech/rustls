@@ -53,6 +53,10 @@ impl RecordLayer {
         }
     }
 
+    pub(crate) fn is_decrypting(&self) -> bool {
+        self.decrypt_state == DirectionState::Active
+    }
+
     /// Decrypt a TLS message.
     ///
     /// `encr` is a decoded message allegedly received from the peer.

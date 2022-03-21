@@ -9,7 +9,7 @@ use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
 #[cfg(feature = "logging")]
 use crate::log::{debug, trace};
-use crate::msgs::base::Payload;
+use crate::msgs::base::{Payload, PayloadU8};
 use crate::msgs::enums::{Compression, ExtensionType};
 use crate::msgs::enums::{ECPointFormat, PSKKeyExchangeMode};
 use crate::msgs::handshake::ConvertProtocolNameList;
@@ -104,7 +104,11 @@ pub(super) fn start_handshake(
         transcript_buffer.set_client_auth_enabled();
     }
 
-    let mut resuming = find_session(&server_name, &config, cx);
+    let mut resuming = if cx.common.client_verify_data.is_empty() {
+        find_session(&server_name, &config, cx)
+    } else {
+        None
+    };
 
     let key_share = if config.supports_version(ProtocolVersion::TLSv1_3) {
         Some(tls13::initial_key_share(&config, &server_name)?)
@@ -271,12 +275,6 @@ fn emit_client_hello_for_retry(
     // Do we have a SessionID or ticket cached for this host?
     let tls13_session = prepare_resumption(&input.resuming, &mut exts, suite, cx, config);
 
-    // Note what extensions we sent.
-    input.hello.sent_extensions = exts
-        .iter()
-        .map(ClientExtension::get_type)
-        .collect();
-
     let mut cipher_suites: Vec<_> = config
         .provider
         .cipher_suites
@@ -286,8 +284,20 @@ fn emit_client_hello_for_retry(
             false => None,
         })
         .collect();
-    // We don't do renegotiation at all, in fact.
-    cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
+
+    if cx.common.client_verify_data.is_empty() {
+        cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
+    } else {
+        exts.push(ClientExtension::RenegotiationInfo(PayloadU8::new(
+            cx.common.client_verify_data.clone(),
+        )));
+    }
+
+    // Note what extensions we sent.
+    input.hello.sent_extensions = exts
+        .iter()
+        .map(ClientExtension::get_type)
+        .collect();
 
     let mut chp = HandshakeMessagePayload {
         typ: HandshakeType::ClientHello,
@@ -312,7 +322,7 @@ fn emit_client_hello_for_retry(
         // "This value MUST be set to 0x0303 for all records generated
         //  by a TLS 1.3 implementation other than an initial ClientHello
         //  (i.e., one not generated after a HelloRetryRequest)"
-        version: if retryreq.is_some() {
+        version: if retryreq.is_some() || !cx.common.client_verify_data.is_empty() {
             ProtocolVersion::TLSv1_2
         } else {
             ProtocolVersion::TLSv1_0
@@ -329,7 +339,8 @@ fn emit_client_hello_for_retry(
     trace!("Sending ClientHello {:#?}", ch);
 
     transcript_buffer.add_message(&ch);
-    cx.common.send_msg(ch, false);
+    cx.common
+        .send_msg(ch, !cx.common.client_verify_data.is_empty());
 
     // Calculate the hash of ClientHello and use it to derive EarlyTrafficSecret
     let early_key_schedule = early_key_schedule.map(|(resuming_suite, schedule)| {
@@ -662,6 +673,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
                     randoms,
                     using_ems: self.input.using_ems,
                     transcript,
+                    message_decrypter: None,
                 }
                 .handle_server_hello(cx, suite, server_hello, tls13_supported)
             }

@@ -90,8 +90,6 @@ impl MessageDeframer {
             let end = start + rd.used();
             let version_is_tls13 = matches!(negotiated_version, Some(ProtocolVersion::TLSv1_3));
             let allowed_plaintext = match m.typ {
-                // CCS messages are always plaintext.
-                ContentType::ChangeCipherSpec => true,
                 // Alerts are allowed to be plaintext if-and-only-if:
                 // * The negotiated protocol version is TLS 1.3. - In TLS 1.2 it is unambiguous when
                 //   keying changes based on the CCS message. Only TLS 1.3 requires these heuristics.
