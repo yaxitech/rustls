@@ -870,6 +870,9 @@ pub struct CommonState {
     pub(crate) quic: Quic,
     #[cfg(feature = "secret_extraction")]
     pub(crate) enable_secret_extraction: bool,
+    pub(crate) secure_renegotiation: Option<bool>,
+    pub(crate) client_verify_data: Vec<u8>,
+    pub(crate) server_verify_data: Vec<u8>,
 }
 
 impl CommonState {
@@ -899,6 +902,9 @@ impl CommonState {
             quic: Quic::new(),
             #[cfg(feature = "secret_extraction")]
             enable_secret_extraction: false,
+            secure_renegotiation: None,
+            client_verify_data: Vec::new(),
+            server_verify_data: Vec::new(),
         }
     }
 
@@ -973,12 +979,17 @@ impl CommonState {
         // renegotiation requests.  These can occur any time.
         if self.may_receive_application_data && !self.is_tls13() {
             let reject_ty = match self.side {
-                Side::Client => HandshakeType::HelloRequest,
-                Side::Server => HandshakeType::ClientHello,
+                #[cfg(feature = "renegotiation")]
+                Side::Client => None,
+                #[cfg(not(feature = "renegotiation"))]
+                Side::Client => Some(HandshakeType::HelloRequest),
+                Side::Server => Some(HandshakeType::ClientHello),
             };
-            if msg.is_handshake_type(reject_ty) {
-                self.send_warning_alert(AlertDescription::NoRenegotiation);
-                return Ok(state);
+            if let Some(reject_ty) = reject_ty {
+                if msg.is_handshake_type(reject_ty) {
+                    self.send_warning_alert(AlertDescription::NoRenegotiation);
+                    return Ok(state);
+                }
             }
         }
 
